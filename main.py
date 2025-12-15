@@ -21,21 +21,18 @@ PIER_MIN = 0.30
 Rect = Tuple[float, float, float, float]  # (x1,x2,y1,y2)
 
 # ============================================================
-#  DEFAULTS (🔥 come richiesto: veloci)
+#  DEFAULTS (come richiesto)
 # ============================================================
 DEFAULTS = {
-    # output
     "stress": 0,
     "verbose": 0,
 
-    # mesh / analisi
     "max_dx": 0.30,
     "max_dy": 0.30,
     "dU": 0.0006,
     "max_steps": 100,
     "target_mm": 15.0,
 
-    # carichi / solver
     "Ptot": 100e3,
     "testTol": 1.0e-4,
     "testIter": 15,
@@ -44,22 +41,16 @@ DEFAULTS = {
     "numberer": "RCM",
     "constraints": "Plain",
 
-    # stress profiles (se stress=1)
     "n_bins_x": 4,
     "n_bins_y": 12,
 
-    # screening / greedy
     "grid_zx": 3,
     "grid_zy": 5,
     "min_solid_ratio": 0.85,
     "greedy_topN": 25,
 
-    # FRCM selection mode (fix “zona non cambia mai”)
-    # "centroid" = vecchio (può non prendere elementi)
-    # "intersection" = nuovo (consigliato)
+    # fix selezione rinforzo: intersezione elemento-zona
     "frcm_mode": "intersection",
-
-    # se intersection: quanto deve sovrapporsi l’elemento alla zona (0..1)
     "frcm_min_overlap": 0.02,
 }
 
@@ -80,6 +71,37 @@ CLAMPS = {
 
     "frcm_min_overlap": (0.0, 1.0),
 }
+
+# ============================================================
+#  PAYLOAD UNWRAP (🔥 fix vero: Lovable / wrapper / nesting)
+# ============================================================
+def _unwrap_payload(obj: Any) -> Dict[str, Any]:
+    """
+    Accetta:
+      - {"openings":...} (dict)
+      - [ {...} ] (lista con 1 dict)
+      - {"data": {...}} / {"body": {...}} / {"input": {...}} / {"payload": {...}}
+      - anche nesting in "next"
+    Restituisce sempre un dict o {}.
+    """
+    # strip wrapper list
+    while isinstance(obj, list) and len(obj) == 1:
+        obj = obj[0]
+
+    if not isinstance(obj, dict):
+        return {}
+
+    # unwrap common containers
+    for k in ("data", "body", "input", "payload"):
+        v = obj.get(k)
+        if isinstance(v, dict):
+            obj = v
+            break
+        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], dict):
+            obj = v[0]
+            break
+
+    return obj if isinstance(obj, dict) else {}
 
 # ============================================================
 #  PARSING / CLAMP
@@ -111,9 +133,6 @@ def _clamp(name: str, val: Union[int, float]) -> Union[int, float]:
     return float(max(lo, min(val, hi)))
 
 def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ✅ default -> body -> query (query vince sempre)
-    """
     out = dict(DEFAULTS)
 
     # body
@@ -121,7 +140,7 @@ def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, A
         if k in payload:
             out[k] = payload[k]
 
-    # query vince sul body
+    # query vince
     for k in DEFAULTS:
         if k in query and query[k] is not None:
             out[k] = query[k]
@@ -129,13 +148,11 @@ def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, A
     out["stress"] = 1 if _as_int(out["stress"], 0) == 1 else 0
     out["verbose"] = 1 if _as_int(out.get("verbose", 0), 0) == 1 else 0
 
-    # numerici
     for k in ["max_dx", "max_dy", "dU", "target_mm", "Ptot", "testTol", "min_solid_ratio", "frcm_min_overlap"]:
         out[k] = _clamp(k, _as_float(out.get(k), DEFAULTS[k]))
     for k in ["max_steps", "testIter", "n_bins_x", "n_bins_y", "grid_zx", "grid_zy", "greedy_topN"]:
         out[k] = _clamp(k, _as_int(out.get(k), DEFAULTS[k]))
 
-    # stringhe
     out["algo"] = str(out.get("algo", DEFAULTS["algo"]))
     out["system"] = str(out.get("system", DEFAULTS["system"]))
     out["numberer"] = str(out.get("numberer", DEFAULTS["numberer"]))
@@ -145,14 +162,9 @@ def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, A
     return out
 
 # ============================================================
-#  RECT / OPENINGS UTILS
+#  RECT UTILS
 # ============================================================
 def _normalize_rects(obj: Any) -> List[Rect]:
-    """
-    Supporta:
-      - [[x1,x2,y1,y2], ...]
-      - [{"x1":..,"x2":..,"y1":..,"y2":..}, ...]
-    """
     out: List[Rect] = []
     if obj is None:
         return out
@@ -216,7 +228,7 @@ def rect_intersection_area(a: Rect, b: Rect) -> float:
     return (ix2 - ix1) * (iy2 - iy1)
 
 # ============================================================
-#  ZONE UTILS (heatmap candidates)
+#  ZONE UTILS
 # ============================================================
 def generate_candidate_zones(openings: List[Rect], nZX: int, nZY: int, min_solid_ratio: float) -> Dict[str, Any]:
     zones: List[Dict[str, Any]] = []
@@ -244,17 +256,12 @@ def generate_candidate_zones(openings: List[Rect], nZX: int, nZY: int, min_solid
     return {"grid": {"nZX": nZX, "nZY": nZY}, "zones": zones}
 
 def make_heatmap_cells(zones: List[Dict[str, Any]], value_key: str) -> List[Dict[str, Any]]:
-    cells = []
-    for z in zones:
-        cells.append({
-            "id": z["id"],
-            "i": z["i"],
-            "j": z["j"],
-            "x1": z["x1"], "x2": z["x2"], "y1": z["y1"], "y2": z["y2"],
-            "solid_ratio": z.get("solid_ratio"),
-            "value": z.get(value_key),
-        })
-    return cells
+    return [{
+        "id": z["id"], "i": z["i"], "j": z["j"],
+        "x1": z["x1"], "x2": z["x2"], "y1": z["y1"], "y2": z["y2"],
+        "solid_ratio": z.get("solid_ratio"),
+        "value": z.get(value_key),
+    } for z in zones]
 
 def _is_selected_zone(z: Dict[str, Any], selected_rects: List[Rect]) -> bool:
     rz = _rect_key_from_zone(z)
@@ -299,7 +306,7 @@ def build_conforming_grid(openings: List[Rect], max_dx: float, max_dy: float) ->
     return xs, ys
 
 # ============================================================
-#  MATERIALI
+#  MATERIALI + SELEZIONE FRCM
 # ============================================================
 def K_from_E_nu(E: float, nu: float) -> float:
     return E / (3.0 * (1.0 - 2.0 * nu))
@@ -307,16 +314,6 @@ def K_from_E_nu(E: float, nu: float) -> float:
 def G_from_E_nu(E: float, nu: float) -> float:
     return E / (2.0 * (1.0 + nu))
 
-# vecchio (centroide)
-def point_in_any_zone(xc: float, yc: float, zones: List[Dict[str, float]]) -> bool:
-    for z in zones:
-        x1, x2 = float(z["x1"]), float(z["x2"])
-        y1, y2 = float(z["y1"]), float(z["y2"])
-        if (xc >= x1) and (xc <= x2) and (yc >= y1) and (yc <= y2):
-            return True
-    return False
-
-# nuovo (intersezione elemento-zona)
 def quad_bbox(x1: float, x2: float, y1: float, y2: float) -> Rect:
     return (min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2))
 
@@ -325,9 +322,6 @@ def rect_area(r: Rect) -> float:
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 def overlaps_any_zone(elem_rect: Rect, zones: List[Dict[str, float]], min_overlap_ratio: float) -> bool:
-    """
-    True se area_intersezione(elem,zona) / area_elem >= min_overlap_ratio
-    """
     a_elem = rect_area(elem_rect)
     if a_elem <= 0:
         return False
@@ -339,7 +333,7 @@ def overlaps_any_zone(elem_rect: Rect, zones: List[Dict[str, float]], min_overla
     return False
 
 # ============================================================
-#  BUILD MODEL (muratura + cordoli + FRCM proxy)
+#  BUILD MODEL
 # ============================================================
 def build_wall_J2_conforming_with_frcm(
     openings: List[Rect],
@@ -365,13 +359,11 @@ def build_wall_J2_conforming_with_frcm(
             node_tags[(i, j)] = tag
             tag += 1
 
-    # vincoli base
     for i in range(len(xs)):
         key = (i, 0)
         if key in node_tags:
             ops.fix(node_tags[key], 1, 1)
 
-    # materiali
     E_mur, nu_mur = 1.5e9, 0.15
     sig0_m, sigInf_m, delta_m, H_m = 0.5e6, 2.0e6, 8.0, 0.0
 
@@ -389,18 +381,18 @@ def build_wall_J2_conforming_with_frcm(
     ops.nDMaterial("J2Plasticity", 20, K_c, G_c, sig0_c, sigInf_c, delta_c, H_c)
     ops.nDMaterial("J2Plasticity", 30, K_f, G_f, sig0_f, sigInf_f, delta_f, H_f)
 
-    ops.nDMaterial("PlaneStress", 1, 10)  # mur
-    ops.nDMaterial("PlaneStress", 2, 20)  # cord
-    ops.nDMaterial("PlaneStress", 3, 30)  # frcm
+    ops.nDMaterial("PlaneStress", 1, 10)
+    ops.nDMaterial("PlaneStress", 2, 20)
+    ops.nDMaterial("PlaneStress", 3, 30)
+
+    frcm_mode = (frcm_mode or "intersection").strip().lower()
+    if frcm_mode not in ("centroid", "intersection"):
+        frcm_mode = "intersection"
 
     t = 0.25
     eleTag = 1
     ele_mat: Dict[int, int] = {}
     frcm_hits = 0
-
-    frcm_mode = (frcm_mode or "intersection").strip().lower()
-    if frcm_mode not in ("centroid", "intersection"):
-        frcm_mode = "intersection"
 
     for j in range(len(ys) - 1):
         y1e, y2e = ys[j], ys[j + 1]
@@ -414,17 +406,10 @@ def build_wall_J2_conforming_with_frcm(
             if not all(k in node_tags for k in keys):
                 continue
 
-            xc = 0.5 * (x1e + x2e)
-
-            # regola: cordolo vince, frcm solo su muratura
             this_mat = 2 if in_cord else 1
 
             if (not in_cord) and frcm_zones:
-                if frcm_mode == "centroid":
-                    if point_in_any_zone(xc, yc, frcm_zones):
-                        this_mat = 3
-                        frcm_hits += 1
-                else:
+                if frcm_mode == "intersection":
                     elem_rect = quad_bbox(x1e, x2e, y1e, y2e)
                     if overlaps_any_zone(elem_rect, frcm_zones, min_overlap_ratio=frcm_min_overlap):
                         this_mat = 3
@@ -439,7 +424,6 @@ def build_wall_J2_conforming_with_frcm(
             ele_mat[eleTag] = this_mat
             eleTag += 1
 
-    # carico in sommità
     j_top = len(ys) - 1
     top_nodes = [node_tags[(i, j_top)] for i in range(len(xs)) if (i, j_top) in node_tags]
     if not top_nodes:
@@ -468,69 +452,6 @@ def build_wall_J2_conforming_with_frcm(
     }
 
 # ============================================================
-#  STRESS PROFILES (opzionale)
-# ============================================================
-def _compute_stress_grid_profiles(n_bins_x: int, n_bins_y: int) -> Dict[str, Any]:
-    ele_tags = ops.getEleTags()
-    if not ele_tags:
-        return {"tau_profile_y": {"y": [], "tau_mean": []},
-                "sigma_profile_y": {"y": [], "sigma_c_mean": []},
-                "zones": []}
-
-    y_edges = np.linspace(0.0, H, n_bins_y + 1)
-    y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
-    x_edges = np.linspace(0.0, L, n_bins_x + 1)
-
-    tau_sum_y = np.zeros(n_bins_y)
-    tau_cnt_y = np.zeros(n_bins_y)
-    sigc_sum_y = np.zeros(n_bins_y)
-    sigc_cnt_y = np.zeros(n_bins_y)
-
-    for ele in ele_tags:
-        stress = ops.eleResponse(ele, "stress")
-        if stress is None:
-            continue
-
-        tau_vals = []
-        sigy_vals = []
-        for k in range(0, len(stress), 3):
-            sigy_vals.append(float(stress[k + 1]))
-            tau_vals.append(abs(float(stress[k + 2])))
-
-        if not tau_vals:
-            continue
-
-        tau_mean_el = float(sum(tau_vals) / len(tau_vals))
-        sigma_c_el = float(abs(min(sigy_vals)))
-
-        nds = ops.eleNodes(ele)
-        ys_el = [float(ops.nodeCoord(nd)[1]) for nd in nds]
-        xs_el = [float(ops.nodeCoord(nd)[0]) for nd in nds]
-        yc = sum(ys_el) / len(ys_el)
-        xc = sum(xs_el) / len(xs_el)
-
-        j = int(np.searchsorted(y_edges, yc) - 1)
-        i = int(np.searchsorted(x_edges, xc) - 1)
-        if j < 0 or j >= n_bins_y or i < 0 or i >= n_bins_x:
-            continue
-
-        tau_sum_y[j] += tau_mean_el
-        tau_cnt_y[j] += 1
-        sigc_sum_y[j] += sigma_c_el
-        sigc_cnt_y[j] += 1
-
-    y_out = [float(y_centers[j]) for j in range(n_bins_y) if tau_cnt_y[j] > 0]
-    tau_mean = [float(tau_sum_y[j] / tau_cnt_y[j]) for j in range(n_bins_y) if tau_cnt_y[j] > 0]
-    y_sig = [float(y_centers[j]) for j in range(n_bins_y) if sigc_cnt_y[j] > 0]
-    sigc_mean = [float(sigc_sum_y[j] / sigc_cnt_y[j]) for j in range(n_bins_y) if sigc_cnt_y[j] > 0]
-
-    return {
-        "tau_profile_y": {"y": y_out, "tau_mean": tau_mean},
-        "sigma_profile_y": {"y": y_sig, "sigma_c_mean": sigc_mean},
-        "zones": []
-    }
-
-# ============================================================
 #  PUSHOVER CORE
 # ============================================================
 def shear_at_target_disp(disp_mm: np.ndarray, shear_kN: np.ndarray, target_mm: float) -> Optional[float]:
@@ -555,11 +476,6 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
             "debug": {"params_used": params},
         }
 
-    verbose = int(params.get("verbose", 0)) == 1
-    buf = io.StringIO() if verbose else None
-
-    # ---- BUILD ----
-    t_build0 = time.time()
     model = build_wall_J2_conforming_with_frcm(
         openings=openings,
         frcm_zones=frcm_zones or [],
@@ -569,7 +485,6 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
         frcm_mode=str(params.get("frcm_mode", "intersection")),
         frcm_min_overlap=float(params.get("frcm_min_overlap", 0.02)),
     )
-    t_build = time.time() - t_build0
 
     node_tags = model["node_tags"]
     control_node = model["control_node"]
@@ -587,35 +502,22 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
         "frcm_min_overlap": model.get("frcm_min_overlap"),
     }
 
-    # ---- SETUP ----
-    t_setup0 = time.time()
     ops.constraints(str(params["constraints"]))
     ops.numberer(str(params["numberer"]))
     ops.system(str(params["system"]))
     ops.test("NormUnbalance", float(params["testTol"]), int(params["testIter"]))
-    # coerente col tuo baseline
     ops.algorithm("Newton")
     ops.integrator("DisplacementControl", int(control_node), 1, float(params["dU"]))
     ops.analysis("Static")
-    t_setup = time.time() - t_setup0
 
-    # ---- LOOP ----
     max_steps = int(params["max_steps"])
     target_mm = float(params["target_mm"])
 
     disp_mm: List[float] = []
     shear_kN: List[float] = []
 
-    t_loop0 = time.time()
     for step in range(max_steps):
-        if verbose and buf is not None:
-            buf.truncate(0)
-            buf.seek(0)
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                ok = ops.analyze(1)
-        else:
-            ok = ops.analyze(1)
-
+        ok = ops.analyze(1)
         if ok < 0:
             return {
                 "status": "error",
@@ -624,20 +526,11 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
                 "shear_kN": shear_kN,
                 "V_target": None,
                 "mesh": mesh_info,
-                "timing_s": {
-                    "build": float(t_build),
-                    "setup": float(t_setup),
-                    "loop": float(time.time() - t_loop0),
-                    "stress_profiles": 0.0,
-                    "total": float(time.time() - t0),
-                },
-                "debug": {
-                    "params_used": params,
-                    "stdout_tail": (buf.getvalue().strip()[-1200:] if (verbose and buf) else None),
-                },
+                "timing_s": {"total": float(time.time() - t0)},
+                "debug": {"params_used": params},
             }
 
-        u = float(ops.nodeDisp(control_node, 1))  # m
+        u = float(ops.nodeDisp(control_node, 1))
         ops.reactions()
 
         Vb = 0.0
@@ -650,43 +543,28 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
         if disp_mm[-1] >= target_mm:
             break
 
-    t_loop = time.time() - t_loop0
-
     disp_arr = np.array(disp_mm, dtype=float)
     shear_arr = np.array(shear_kN, dtype=float)
     Vt = shear_at_target_disp(disp_arr, shear_arr, target_mm)
 
-    out: Dict[str, Any] = {
+    return {
         "status": "ok" if Vt is not None else "error",
         "message": None if Vt is not None else "analysis_not_reached_target",
         "disp_mm": disp_arr.tolist(),
         "shear_kN": shear_arr.tolist(),
         "V_target": Vt,
         "mesh": mesh_info,
-        "timing_s": {
-            "build": float(t_build),
-            "setup": float(t_setup),
-            "loop": float(t_loop),
-            "stress_profiles": 0.0,
-            "total": float(time.time() - t0),
-        },
+        "timing_s": {"total": float(time.time() - t0)},
         "debug": {"params_used": params},
     }
-
-    if int(params["stress"]) == 1:
-        t_st0 = time.time()
-        out["stress_profiles"] = _compute_stress_grid_profiles(int(params["n_bins_x"]), int(params["n_bins_y"]))
-        out["timing_s"]["stress_profiles"] = float(time.time() - t_st0)
-
-    return out
 
 # ============================================================
 #  FASTAPI
 # ============================================================
 app = FastAPI(
     title="Wall Pushover + FRCM Screening (Conforming Mesh)",
-    version="6.0.0",
-    description="Baseline + screening zone FRCM + greedy add, con defaults veloci + debug + fix selezione FRCM."
+    version="7.0.0",
+    description="Fix definitivo parsing /frcm/add + debug payload + defaults veloci."
 )
 
 @app.get("/")
@@ -699,8 +577,6 @@ def root():
 @app.post("/frcm/screening")
 async def frcm_screening(
     request: Request,
-
-    # query params opzionali
     max_dx: Optional[float] = None,
     max_dy: Optional[float] = None,
     dU: Optional[float] = None,
@@ -711,21 +587,16 @@ async def frcm_screening(
     testIter: Optional[int] = None,
     stress: Optional[int] = None,
     verbose: Optional[int] = None,
-
     grid_zx: Optional[int] = None,
     grid_zy: Optional[int] = None,
     min_solid_ratio: Optional[float] = None,
-
     frcm_mode: Optional[str] = None,
     frcm_min_overlap: Optional[float] = None,
 ):
-    payload = await request.json()
-    if isinstance(payload, list):
-        if not payload:
-            return JSONResponse(status_code=400, content={"error": "Payload list vuota."})
-        payload = payload[0]
-    if not isinstance(payload, dict):
-        return JSONResponse(status_code=400, content={"error": "Payload non valido: atteso oggetto JSON."})
+    raw = await request.json()
+    payload = _unwrap_payload(raw)
+    if not payload:
+        return JSONResponse(status_code=400, content={"error": "Payload non valido."})
 
     query = {
         "max_dx": max_dx, "max_dy": max_dy, "dU": dU, "max_steps": max_steps,
@@ -738,112 +609,54 @@ async def frcm_screening(
 
     openings = _normalize_rects(payload.get("openings") or payload.get("project_openings") or payload.get("existing_openings"))
     if not openings:
-        return JSONResponse(status_code=400, content={"error": "Manca 'openings' (o project_openings/existing_openings)."})
+        return JSONResponse(status_code=400, content={"error": "Manca 'openings'."})
     if not openings_valid(openings):
         return JSONResponse(status_code=400, content={"error": "openings_invalid"})
 
     t_req0 = time.time()
 
-    # 1) candidate zones
-    t_z0 = time.time()
     cand = generate_candidate_zones(
         openings=openings,
         nZX=int(params["grid_zx"]),
         nZY=int(params["grid_zy"]),
         min_solid_ratio=float(params["min_solid_ratio"]),
     )
-    t_z = time.time() - t_z0
 
-    # 2) baseline
     baseline = run_pushover_case(openings=openings, frcm_zones=[], params=params)
     if baseline["status"] != "ok":
         return JSONResponse(content={
-            "meta": {
-                "params_used": params,
-                "timing_s": {"request_total": float(time.time() - t_req0), "zones_gen": float(t_z)},
-                "debug": {"note": "baseline_failed"},
-            },
+            "meta": {"params_used": params, "timing_s": {"request_total": float(time.time() - t_req0)}},
             "baseline": baseline,
             "screening": {"grid": cand["grid"], "zones": [], "heatmap": []},
             "recommendation": None,
         })
 
     Vbase = float(baseline["V_target"])
-
-    # 3) single-zone screening
-    zones = cand["zones"]
-    t_sc0 = time.time()
     results: List[Dict[str, Any]] = []
 
-    for z in zones:
+    for z in cand["zones"]:
         frcm = [{"x1": z["x1"], "x2": z["x2"], "y1": z["y1"], "y2": z["y2"]}]
         out = run_pushover_case(openings=openings, frcm_zones=frcm, params=params)
         Vz = out.get("V_target")
         deltaV = (float(Vz) - Vbase) if (Vz is not None) else None
-
-        results.append({
-            **z,
-            "V_target": Vz,
-            "deltaV_single": deltaV,
-            "case": {
-                "status": out["status"],
-                "message": out["message"],
-                "mesh": out.get("mesh"),
-                "timing_s": out.get("timing_s"),
-            }
-        })
-
-    t_sc = time.time() - t_sc0
+        results.append({**z, "V_target": Vz, "deltaV_single": deltaV})
 
     valid = [r for r in results if isinstance(r.get("deltaV_single"), (int, float))]
     best = max(valid, key=lambda r: float(r["deltaV_single"])) if valid else None
 
-    best_case = None
-    if best is not None:
-        frcm_best = [{"x1": best["x1"], "x2": best["x2"], "y1": best["y1"], "y2": best["y2"]}]
-        best_case = run_pushover_case(openings=openings, frcm_zones=frcm_best, params=params)
-
-    heatmap = make_heatmap_cells(results, "deltaV_single")
-
-    resp = {
-        "meta": {
-            "params_used": params,
-            "timing_s": {
-                "zones_gen": float(t_z),
-                "screening_loop": float(t_sc),
-                "request_total": float(time.time() - t_req0),
-            },
-            "debug": {
-                "n_candidates": len(zones),
-                "opening_count": len(openings),
-            }
-        },
+    return JSONResponse(content={
+        "meta": {"params_used": params, "timing_s": {"request_total": float(time.time() - t_req0)}},
         "baseline": baseline,
-        "screening": {
-            "grid": cand["grid"],
-            "zones": results,
-            "heatmap": heatmap,
-        },
-        "recommendation": (None if best is None else {
-            "best_zone": {
-                "id": best["id"], "i": best["i"], "j": best["j"],
-                "x1": best["x1"], "x2": best["x2"], "y1": best["y1"], "y2": best["y2"],
-                "solid_ratio": best["solid_ratio"],
-                "deltaV_single": best["deltaV_single"],
-            },
-            "best_case": best_case,
-        }),
-    }
-    return JSONResponse(content=resp)
+        "screening": {"grid": cand["grid"], "zones": results, "heatmap": make_heatmap_cells(results, "deltaV_single")},
+        "recommendation": (None if best is None else {"best_zone": best}),
+    })
 
 # ============================================================
-#  /frcm/add (greedy add)
+#  /frcm/add (🔥 FIX QUI)
 # ============================================================
 @app.post("/frcm/add")
 async def frcm_add(
     request: Request,
-
-    # query params opzionali (coerenti con screening)
     max_dx: Optional[float] = None,
     max_dy: Optional[float] = None,
     dU: Optional[float] = None,
@@ -854,22 +667,17 @@ async def frcm_add(
     testIter: Optional[int] = None,
     stress: Optional[int] = None,
     verbose: Optional[int] = None,
-
     grid_zx: Optional[int] = None,
     grid_zy: Optional[int] = None,
     min_solid_ratio: Optional[float] = None,
     greedy_topN: Optional[int] = None,
-
     frcm_mode: Optional[str] = None,
     frcm_min_overlap: Optional[float] = None,
 ):
-    payload = await request.json()
-    if isinstance(payload, list):
-        if not payload:
-            return JSONResponse(status_code=400, content={"error": "Payload list vuota."})
-        payload = payload[0]
-    if not isinstance(payload, dict):
-        return JSONResponse(status_code=400, content={"error": "Payload non valido: atteso oggetto JSON."})
+    raw = await request.json()
+    payload = _unwrap_payload(raw)
+    if not payload:
+        return JSONResponse(status_code=400, content={"error": "Payload non valido."})
 
     query = {
         "max_dx": max_dx, "max_dy": max_dy, "dU": dU, "max_steps": max_steps,
@@ -883,174 +691,106 @@ async def frcm_add(
 
     openings = _normalize_rects(payload.get("openings") or payload.get("project_openings") or payload.get("existing_openings"))
     if not openings:
-        return JSONResponse(status_code=400, content={"error": "Manca 'openings' (o project_openings/existing_openings)."})
+        return JSONResponse(status_code=400, content={"error": "Manca 'openings'."})
     if not openings_valid(openings):
         return JSONResponse(status_code=400, content={"error": "openings_invalid"})
 
-    # selected zones (robusto)
-    selected_rects: List[Rect] = _normalize_rects(payload.get("selected_zones"))
+    # ✅ leggi selected_zones anche se arriva nested
+    selected_raw = (
+        payload.get("selected_zones")
+        or payload.get("selectedZones")
+        or (payload.get("next") or {}).get("selected_zones")
+        or (payload.get("next") or {}).get("selectedZones")
+    )
+    selected_rects: List[Rect] = _normalize_rects(selected_raw)
     selected: List[Dict[str, float]] = [{"x1": x1, "x2": x2, "y1": y1, "y2": y2} for (x1, x2, y1, y2) in selected_rects]
 
-    ranked = payload.get("ranked_candidates")
+    # ✅ ranked candidates: snake o camel
+    ranked_raw = payload.get("ranked_candidates") or payload.get("rankedCandidates")
+    ranked_list = ranked_raw if isinstance(ranked_raw, list) else []
 
     t_req0 = time.time()
 
-    # rigenera candidates (coerente con screening)
-    t_z0 = time.time()
     cand = generate_candidate_zones(
         openings=openings,
         nZX=int(params["grid_zx"]),
         nZY=int(params["grid_zy"]),
         min_solid_ratio=float(params["min_solid_ratio"]),
     )
-    t_z = time.time() - t_z0
     zones = cand["zones"]
 
-    # se payload porta già ranking dallo screening, lo usiamo per scegliere topN
+    # ranking by id
     ranked_ids_received: List[str] = []
-    if isinstance(ranked, list) and ranked:
+    if ranked_list:
         zones_by_id = {z["id"]: z for z in zones}
         ranked_zones = []
-        for r in ranked:
-            zid = r.get("id")
+        for r in ranked_list:
+            zid = (r or {}).get("id")
             if zid in zones_by_id:
                 ranked_ids_received.append(zid)
                 z = zones_by_id[zid].copy()
-                z["deltaV_single_hint"] = r.get("deltaV_single")
+                z["deltaV_single_hint"] = (r or {}).get("deltaV_single")
                 ranked_zones.append(z)
         ranked_zones.sort(key=lambda z: float(z.get("deltaV_single_hint") or -1e18), reverse=True)
         zones_eval = ranked_zones
     else:
         zones_eval = zones
 
-    topN = int(params["greedy_topN"])
-
-    # filtro: escludi già selezionate
+    # ✅ qui sta il punto: ESCLUDI davvero le già selezionate
     excluded_ids = [z["id"] for z in zones_eval if _is_selected_zone(z, selected_rects)]
     zones_eval = [z for z in zones_eval if not _is_selected_zone(z, selected_rects)]
-    zones_eval = zones_eval[:topN]
+    zones_eval = zones_eval[: int(params["greedy_topN"])]
 
-    # ✅ current con rinforzi selezionati
+    # ✅ current deve includere selected
     current = run_pushover_case(openings=openings, frcm_zones=[dict(s) for s in selected], params=params)
-    if current["status"] != "ok":
-        return JSONResponse(content={
-            "meta": {"params_used": params, "timing_s": {"request_total": float(time.time() - t_req0), "zones_gen": float(t_z)}},
-            "current": current,
-            "added": None,
-            "next": None,
-            "debug": {
-                "selected_rects_parsed": selected_rects,
-                "ranked_ids_received": ranked_ids_received,
-                "excluded_ids": excluded_ids,
-                "evaluated_ids": [],
-            }
-        })
+    Vcur = float(current["V_target"]) if current["status"] == "ok" and current.get("V_target") is not None else None
 
-    Vcur = float(current["V_target"])
-
-    # prova aggiunta di ciascuna candidata (solo topN)
-    t_g0 = time.time()
     trials: List[Dict[str, Any]] = []
     best_trial: Optional[Dict[str, Any]] = None
 
-    for z in zones_eval:
-        trial_zones = [dict(s) for s in selected] + [{"x1": z["x1"], "x2": z["x2"], "y1": z["y1"], "y2": z["y2"]}]
-        out = run_pushover_case(openings=openings, frcm_zones=trial_zones, params=params)
-        Vt = out.get("V_target")
-        deltaV = (float(Vt) - Vcur) if (Vt is not None) else None
-
-        rec = {
-            **z,
-            "V_target": Vt,
-            "deltaV_marginal": deltaV,
-            "timing_s": out.get("timing_s"),
-            "mesh": out.get("mesh"),
-            "status": out.get("status"),
-            "message": out.get("message"),
-        }
-        trials.append(rec)
-
-        if deltaV is not None:
-            if (best_trial is None) or (float(deltaV) > float(best_trial["deltaV_marginal"])):
+    if Vcur is not None:
+        for z in zones_eval:
+            trial_zones = [dict(s) for s in selected] + [{"x1": z["x1"], "x2": z["x2"], "y1": z["y1"], "y2": z["y2"]}]
+            out = run_pushover_case(openings=openings, frcm_zones=trial_zones, params=params)
+            Vt = out.get("V_target")
+            deltaV = (float(Vt) - float(Vcur)) if (Vt is not None) else None
+            rec = {**z, "V_target": Vt, "deltaV_marginal": deltaV, "mesh": out.get("mesh"), "status": out.get("status")}
+            trials.append(rec)
+            if deltaV is not None and (best_trial is None or float(deltaV) > float(best_trial["deltaV_marginal"])):
                 best_trial = {**rec, "case": out}
 
-    t_g = time.time() - t_g0
-
-    heatmap = make_heatmap_cells(trials, "deltaV_marginal")
-
-    if best_trial is None:
-        return JSONResponse(content={
-            "meta": {
-                "params_used": params,
-                "timing_s": {
-                    "zones_gen": float(t_z),
-                    "greedy_eval": float(t_g),
-                    "request_total": float(time.time() - t_req0),
-                }
-            },
-            "current": current,
-            "added": None,
-            "next": None,
-            "greedy": {"evaluated": trials, "heatmap": heatmap, "topN": topN},
-            "debug": {
-                "selected_rects_parsed": selected_rects,
-                "ranked_ids_received": ranked_ids_received,
-                "excluded_ids": excluded_ids,
-                "evaluated_ids": [t["id"] for t in trials],
-                "best_trial_id": None,
-            }
-        })
-
-    added_zone = {
-        "id": best_trial["id"], "i": best_trial["i"], "j": best_trial["j"],
-        "x1": best_trial["x1"], "x2": best_trial["x2"],
-        "y1": best_trial["y1"], "y2": best_trial["y2"],
-        "solid_ratio": best_trial.get("solid_ratio"),
-        "deltaV_marginal": best_trial.get("deltaV_marginal"),
-    }
-
-    new_selected = [dict(s) for s in selected] + [{
-        "x1": added_zone["x1"], "x2": added_zone["x2"], "y1": added_zone["y1"], "y2": added_zone["y2"]
-    }]
-
     resp = {
-        "meta": {
-            "params_used": params,
-            "timing_s": {
-                "zones_gen": float(t_z),
-                "greedy_eval": float(t_g),
-                "request_total": float(time.time() - t_req0),
-            }
-        },
+        "meta": {"params_used": params, "timing_s": {"request_total": float(time.time() - t_req0)}},
         "current": current,
-        "added": added_zone,
-        "next": {
-            "selected_zones": new_selected,  # sempre dict
+        "added": (None if best_trial is None else {
+            "id": best_trial["id"], "i": best_trial["i"], "j": best_trial["j"],
+            "x1": best_trial["x1"], "x2": best_trial["x2"], "y1": best_trial["y1"], "y2": best_trial["y2"],
+            "deltaV_marginal": best_trial.get("deltaV_marginal"),
+        }),
+        "next": (None if best_trial is None else {
+            "selected_zones": [dict(s) for s in selected] + [{"x1": best_trial["x1"], "x2": best_trial["x2"], "y1": best_trial["y1"], "y2": best_trial["y2"]}],
             "case": best_trial["case"],
-        },
-        "greedy": {
-            "topN": topN,
-            "evaluated": trials,
-            "heatmap": heatmap,
-        },
+        }),
+        "greedy": {"evaluated": trials, "heatmap": make_heatmap_cells(trials, "deltaV_marginal")},
+        # 🔥 DEBUG che ti dice se Lovable ti sta davvero mandando le chiavi
         "debug": {
+            "payload_keys": list(payload.keys()),
+            "selected_raw_type": str(type(selected_raw)),
+            "ranked_raw_type": str(type(ranked_raw)),
             "selected_rects_parsed": selected_rects,
             "ranked_ids_received": ranked_ids_received,
             "excluded_ids": excluded_ids,
             "evaluated_ids": [t["id"] for t in trials],
-            "best_trial_id": best_trial["id"],
         }
     }
     return JSONResponse(content=resp)
 
 # ============================================================
-#  /pushover (singolo caso con frcm_zones)
+#  /pushover
 # ============================================================
 @app.post("/pushover")
 async def pushover_simple(
     request: Request,
-
-    # query opzionali
     max_dx: Optional[float] = None,
     max_dy: Optional[float] = None,
     dU: Optional[float] = None,
@@ -1061,17 +801,13 @@ async def pushover_simple(
     testIter: Optional[int] = None,
     stress: Optional[int] = None,
     verbose: Optional[int] = None,
-
     frcm_mode: Optional[str] = None,
     frcm_min_overlap: Optional[float] = None,
 ):
-    payload = await request.json()
-    if isinstance(payload, list):
-        if not payload:
-            return JSONResponse(status_code=400, content={"error": "Payload list vuota."})
-        payload = payload[0]
-    if not isinstance(payload, dict):
-        return JSONResponse(status_code=400, content={"error": "Payload non valido: atteso oggetto JSON."})
+    raw = await request.json()
+    payload = _unwrap_payload(raw)
+    if not payload:
+        return JSONResponse(status_code=400, content={"error": "Payload non valido."})
 
     query = {
         "max_dx": max_dx, "max_dy": max_dy, "dU": dU, "max_steps": max_steps,
@@ -1090,10 +826,5 @@ async def pushover_simple(
         return JSONResponse(status_code=400, content={"error": "openings_invalid"})
 
     frcm_zones = [{"x1": a, "x2": b, "y1": c, "y2": d} for (a, b, c, d) in frcm]
-
-    t0 = time.time()
     out = run_pushover_case(openings=openings, frcm_zones=frcm_zones, params=params)
-    return JSONResponse(content={
-        "meta": {"params_used": params, "timing_s": {"request_total": float(time.time() - t0)}},
-        "result": out
-    })
+    return JSONResponse(content={"meta": {"params_used": params}, "result": out})
