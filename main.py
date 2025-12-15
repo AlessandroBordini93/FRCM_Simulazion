@@ -8,7 +8,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import openseespy.opensees as ops
 
-
 # ============================================================
 #  GEOMETRIA / VINCOLI
 # ============================================================
@@ -21,16 +20,15 @@ PIER_MIN = 0.30
 
 Rect = Tuple[float, float, float, float]  # (x1,x2,y1,y2)
 
-
 # ============================================================
-#  DEFAULTS (🔥 come richiesto)
+#  DEFAULTS (🔥 come richiesto: veloci)
 # ============================================================
 DEFAULTS = {
     # output
     "stress": 0,
     "verbose": 0,
 
-    # mesh / analisi (default veloci)
+    # mesh / analisi
     "max_dx": 0.30,
     "max_dy": 0.30,
     "dU": 0.0006,
@@ -50,11 +48,19 @@ DEFAULTS = {
     "n_bins_x": 4,
     "n_bins_y": 12,
 
-    # screening / greedy (default veloci)
+    # screening / greedy
     "grid_zx": 3,
     "grid_zy": 5,
     "min_solid_ratio": 0.85,
     "greedy_topN": 25,
+
+    # FRCM selection mode (fix “zona non cambia mai”)
+    # "centroid" = vecchio (può non prendere elementi)
+    # "intersection" = nuovo (consigliato)
+    "frcm_mode": "intersection",
+
+    # se intersection: quanto deve sovrapporsi l’elemento alla zona (0..1)
+    "frcm_min_overlap": 0.02,
 }
 
 CLAMPS = {
@@ -71,8 +77,9 @@ CLAMPS = {
     "grid_zy": (2, 24),
     "min_solid_ratio": (0.10, 0.95),
     "greedy_topN": (5, 80),
-}
 
+    "frcm_min_overlap": (0.0, 1.0),
+}
 
 # ============================================================
 #  PARSING / CLAMP
@@ -123,19 +130,19 @@ def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, A
     out["verbose"] = 1 if _as_int(out.get("verbose", 0), 0) == 1 else 0
 
     # numerici
-    for k in ["max_dx", "max_dy", "dU", "target_mm", "Ptot", "testTol", "min_solid_ratio"]:
-        out[k] = _clamp(k, _as_float(out[k], DEFAULTS[k]))
+    for k in ["max_dx", "max_dy", "dU", "target_mm", "Ptot", "testTol", "min_solid_ratio", "frcm_min_overlap"]:
+        out[k] = _clamp(k, _as_float(out.get(k), DEFAULTS[k]))
     for k in ["max_steps", "testIter", "n_bins_x", "n_bins_y", "grid_zx", "grid_zy", "greedy_topN"]:
-        out[k] = _clamp(k, _as_int(out[k], DEFAULTS[k]))
+        out[k] = _clamp(k, _as_int(out.get(k), DEFAULTS[k]))
 
     # stringhe
     out["algo"] = str(out.get("algo", DEFAULTS["algo"]))
     out["system"] = str(out.get("system", DEFAULTS["system"]))
     out["numberer"] = str(out.get("numberer", DEFAULTS["numberer"]))
     out["constraints"] = str(out.get("constraints", DEFAULTS["constraints"]))
+    out["frcm_mode"] = str(out.get("frcm_mode", DEFAULTS["frcm_mode"]))
 
     return out
-
 
 # ============================================================
 #  RECT / OPENINGS UTILS
@@ -208,13 +215,10 @@ def rect_intersection_area(a: Rect, b: Rect) -> float:
         return 0.0
     return (ix2 - ix1) * (iy2 - iy1)
 
-
 # ============================================================
 #  ZONE UTILS (heatmap candidates)
 # ============================================================
-def generate_candidate_zones(openings: List[Rect],
-                             nZX: int, nZY: int,
-                             min_solid_ratio: float) -> Dict[str, Any]:
+def generate_candidate_zones(openings: List[Rect], nZX: int, nZY: int, min_solid_ratio: float) -> Dict[str, Any]:
     zones: List[Dict[str, Any]] = []
     dx = L / nZX
     dy = H / nZY
@@ -256,7 +260,6 @@ def _is_selected_zone(z: Dict[str, Any], selected_rects: List[Rect]) -> bool:
     rz = _rect_key_from_zone(z)
     return any(_same_rect(rz, rs) for rs in selected_rects)
 
-
 # ============================================================
 #  MESH CONFORME
 # ============================================================
@@ -280,8 +283,7 @@ def _refine_intervals(coords: List[float], max_step: float) -> List[float]:
                 refined.append(a + seg * k / n)
     return _unique_sorted(refined)
 
-def build_conforming_grid(openings: List[Rect],
-                          max_dx: float, max_dy: float) -> Tuple[List[float], List[float]]:
+def build_conforming_grid(openings: List[Rect], max_dx: float, max_dy: float) -> Tuple[List[float], List[float]]:
     xs = [0.0, L, MARGIN, L - MARGIN]
     ys = [0.0, H, MARGIN, H - MARGIN]
 
@@ -296,7 +298,6 @@ def build_conforming_grid(openings: List[Rect],
     ys = _refine_intervals(_unique_sorted(ys), max_dy)
     return xs, ys
 
-
 # ============================================================
 #  MATERIALI
 # ============================================================
@@ -306,6 +307,7 @@ def K_from_E_nu(E: float, nu: float) -> float:
 def G_from_E_nu(E: float, nu: float) -> float:
     return E / (2.0 * (1.0 + nu))
 
+# vecchio (centroide)
 def point_in_any_zone(xc: float, yc: float, zones: List[Dict[str, float]]) -> bool:
     for z in zones:
         x1, x2 = float(z["x1"]), float(z["x2"])
@@ -314,6 +316,27 @@ def point_in_any_zone(xc: float, yc: float, zones: List[Dict[str, float]]) -> bo
             return True
     return False
 
+# nuovo (intersezione elemento-zona)
+def quad_bbox(x1: float, x2: float, y1: float, y2: float) -> Rect:
+    return (min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2))
+
+def rect_area(r: Rect) -> float:
+    x1, x2, y1, y2 = r
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+def overlaps_any_zone(elem_rect: Rect, zones: List[Dict[str, float]], min_overlap_ratio: float) -> bool:
+    """
+    True se area_intersezione(elem,zona) / area_elem >= min_overlap_ratio
+    """
+    a_elem = rect_area(elem_rect)
+    if a_elem <= 0:
+        return False
+    for z in zones:
+        zr = (float(z["x1"]), float(z["x2"]), float(z["y1"]), float(z["y2"]))
+        inter = rect_intersection_area(elem_rect, zr)
+        if inter / a_elem >= float(min_overlap_ratio):
+            return True
+    return False
 
 # ============================================================
 #  BUILD MODEL (muratura + cordoli + FRCM proxy)
@@ -321,8 +344,11 @@ def point_in_any_zone(xc: float, yc: float, zones: List[Dict[str, float]]) -> bo
 def build_wall_J2_conforming_with_frcm(
     openings: List[Rect],
     frcm_zones: List[Dict[str, float]],
-    max_dx: float, max_dy: float,
-    Ptot: float
+    max_dx: float,
+    max_dy: float,
+    Ptot: float,
+    frcm_mode: str = "intersection",
+    frcm_min_overlap: float = 0.02,
 ) -> Dict[str, Any]:
     ops.wipe()
     ops.model("basic", "-ndm", 2, "-ndf", 2)
@@ -346,15 +372,12 @@ def build_wall_J2_conforming_with_frcm(
             ops.fix(node_tags[key], 1, 1)
 
     # materiali
-    # Muratura
     E_mur, nu_mur = 1.5e9, 0.15
     sig0_m, sigInf_m, delta_m, H_m = 0.5e6, 2.0e6, 8.0, 0.0
 
-    # Cordoli
     E_cord, nu_cord = 30e9, 0.20
     sig0_c, sigInf_c, delta_c, H_c = 6.0e6, 25.0e6, 6.0, 0.0
 
-    # FRCM proxy
     E_frcm, nu_frcm = 3.0e9, 0.18
     sig0_f, sigInf_f, delta_f, H_f = 1.2e6, 4.0e6, 8.0, 0.0
 
@@ -362,12 +385,10 @@ def build_wall_J2_conforming_with_frcm(
     K_c, G_c = K_from_E_nu(E_cord, nu_cord), G_from_E_nu(E_cord, nu_cord)
     K_f, G_f = K_from_E_nu(E_frcm, nu_frcm), G_from_E_nu(E_frcm, nu_frcm)
 
-    # J2 3D tags
     ops.nDMaterial("J2Plasticity", 10, K_m, G_m, sig0_m, sigInf_m, delta_m, H_m)
     ops.nDMaterial("J2Plasticity", 20, K_c, G_c, sig0_c, sigInf_c, delta_c, H_c)
     ops.nDMaterial("J2Plasticity", 30, K_f, G_f, sig0_f, sigInf_f, delta_f, H_f)
 
-    # PlaneStress wrappers
     ops.nDMaterial("PlaneStress", 1, 10)  # mur
     ops.nDMaterial("PlaneStress", 2, 20)  # cord
     ops.nDMaterial("PlaneStress", 3, 30)  # frcm
@@ -375,27 +396,39 @@ def build_wall_J2_conforming_with_frcm(
     t = 0.25
     eleTag = 1
     ele_mat: Dict[int, int] = {}
+    frcm_hits = 0
+
+    frcm_mode = (frcm_mode or "intersection").strip().lower()
+    if frcm_mode not in ("centroid", "intersection"):
+        frcm_mode = "intersection"
 
     for j in range(len(ys) - 1):
-        yc = 0.5 * (ys[j] + ys[j + 1])
+        y1e, y2e = ys[j], ys[j + 1]
+        yc = 0.5 * (y1e + y2e)
 
-        in_cord = False
-        for (y1c, y2c) in CORDOLI_Y:
-            if (yc >= y1c) and (yc <= y2c):
-                in_cord = True
-                break
+        in_cord = any((yc >= y1c) and (yc <= y2c) for (y1c, y2c) in CORDOLI_Y)
 
         for i in range(len(xs) - 1):
+            x1e, x2e = xs[i], xs[i + 1]
             keys = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
             if not all(k in node_tags for k in keys):
                 continue
 
-            xc = 0.5 * (xs[i] + xs[i + 1])
+            xc = 0.5 * (x1e + x2e)
 
             # regola: cordolo vince, frcm solo su muratura
             this_mat = 2 if in_cord else 1
-            if (not in_cord) and frcm_zones and point_in_any_zone(xc, yc, frcm_zones):
-                this_mat = 3
+
+            if (not in_cord) and frcm_zones:
+                if frcm_mode == "centroid":
+                    if point_in_any_zone(xc, yc, frcm_zones):
+                        this_mat = 3
+                        frcm_hits += 1
+                else:
+                    elem_rect = quad_bbox(x1e, x2e, y1e, y2e)
+                    if overlaps_any_zone(elem_rect, frcm_zones, min_overlap_ratio=frcm_min_overlap):
+                        this_mat = 3
+                        frcm_hits += 1
 
             n1 = node_tags[keys[0]]
             n2 = node_tags[keys[1]]
@@ -429,8 +462,10 @@ def build_wall_J2_conforming_with_frcm(
         "n_nodes": len(node_tags),
         "n_eles": eleTag - 1,
         "ele_mat": ele_mat,
+        "frcm_hits": int(frcm_hits),
+        "frcm_mode": frcm_mode,
+        "frcm_min_overlap": float(frcm_min_overlap),
     }
-
 
 # ============================================================
 #  STRESS PROFILES (opzionale)
@@ -495,7 +530,6 @@ def _compute_stress_grid_profiles(n_bins_x: int, n_bins_y: int) -> Dict[str, Any
         "zones": []
     }
 
-
 # ============================================================
 #  PUSHOVER CORE
 # ============================================================
@@ -506,9 +540,7 @@ def shear_at_target_disp(disp_mm: np.ndarray, shear_kN: np.ndarray, target_mm: f
         return None
     return float(np.interp(target_mm, disp_mm, shear_kN))
 
-def run_pushover_case(openings: List[Rect],
-                      frcm_zones: List[Dict[str, float]],
-                      params: Dict[str, Any]) -> Dict[str, Any]:
+def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], params: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
 
     if not openings_valid(openings):
@@ -534,6 +566,8 @@ def run_pushover_case(openings: List[Rect],
         max_dx=float(params["max_dx"]),
         max_dy=float(params["max_dy"]),
         Ptot=float(params["Ptot"]),
+        frcm_mode=str(params.get("frcm_mode", "intersection")),
+        frcm_min_overlap=float(params.get("frcm_min_overlap", 0.02)),
     )
     t_build = time.time() - t_build0
 
@@ -548,6 +582,9 @@ def run_pushover_case(openings: List[Rect],
         "n_y_lines": len(model["ys"]),
         "n_nodes": model["n_nodes"],
         "n_eles": model["n_eles"],
+        "frcm_hits": model.get("frcm_hits", 0),
+        "frcm_mode": model.get("frcm_mode"),
+        "frcm_min_overlap": model.get("frcm_min_overlap"),
     }
 
     # ---- SETUP ----
@@ -556,7 +593,8 @@ def run_pushover_case(openings: List[Rect],
     ops.numberer(str(params["numberer"]))
     ops.system(str(params["system"]))
     ops.test("NormUnbalance", float(params["testTol"]), int(params["testIter"]))
-    ops.algorithm("Newton")  # coerente con baseline
+    # coerente col tuo baseline
+    ops.algorithm("Newton")
     ops.integrator("DisplacementControl", int(control_node), 1, float(params["dU"]))
     ops.analysis("Static")
     t_setup = time.time() - t_setup0
@@ -570,8 +608,9 @@ def run_pushover_case(openings: List[Rect],
 
     t_loop0 = time.time()
     for step in range(max_steps):
-        if verbose:
-            buf.truncate(0); buf.seek(0)
+        if verbose and buf is not None:
+            buf.truncate(0)
+            buf.seek(0)
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 ok = ops.analyze(1)
         else:
@@ -631,9 +670,7 @@ def run_pushover_case(openings: List[Rect],
             "stress_profiles": 0.0,
             "total": float(time.time() - t0),
         },
-        "debug": {
-            "params_used": params,
-        }
+        "debug": {"params_used": params},
     }
 
     if int(params["stress"]) == 1:
@@ -643,20 +680,18 @@ def run_pushover_case(openings: List[Rect],
 
     return out
 
-
 # ============================================================
 #  FASTAPI
 # ============================================================
 app = FastAPI(
     title="Wall Pushover + FRCM Screening (Conforming Mesh)",
-    version="5.0.0",
-    description="Baseline + screening zone FRCM + greedy add, con timing + debug in JSON."
+    version="6.0.0",
+    description="Baseline + screening zone FRCM + greedy add, con defaults veloci + debug + fix selezione FRCM."
 )
 
 @app.get("/")
 def root():
     return {"status": "ok", "service": "pushover-frcm-screening", "defaults": DEFAULTS}
-
 
 # ============================================================
 #  /frcm/screening
@@ -665,7 +700,7 @@ def root():
 async def frcm_screening(
     request: Request,
 
-    # query params opzionali (possono sovrascrivere i defaults)
+    # query params opzionali
     max_dx: Optional[float] = None,
     max_dy: Optional[float] = None,
     dU: Optional[float] = None,
@@ -676,9 +711,13 @@ async def frcm_screening(
     testIter: Optional[int] = None,
     stress: Optional[int] = None,
     verbose: Optional[int] = None,
+
     grid_zx: Optional[int] = None,
     grid_zy: Optional[int] = None,
     min_solid_ratio: Optional[float] = None,
+
+    frcm_mode: Optional[str] = None,
+    frcm_min_overlap: Optional[float] = None,
 ):
     payload = await request.json()
     if isinstance(payload, list):
@@ -693,6 +732,7 @@ async def frcm_screening(
         "target_mm": target_mm, "Ptot": Ptot, "testTol": testTol, "testIter": testIter,
         "stress": stress, "verbose": verbose,
         "grid_zx": grid_zx, "grid_zy": grid_zy, "min_solid_ratio": min_solid_ratio,
+        "frcm_mode": frcm_mode, "frcm_min_overlap": frcm_min_overlap,
     }
     params = _merge_params(payload, query)
 
@@ -796,7 +836,6 @@ async def frcm_screening(
     }
     return JSONResponse(content=resp)
 
-
 # ============================================================
 #  /frcm/add (greedy add)
 # ============================================================
@@ -815,10 +854,14 @@ async def frcm_add(
     testIter: Optional[int] = None,
     stress: Optional[int] = None,
     verbose: Optional[int] = None,
+
     grid_zx: Optional[int] = None,
     grid_zy: Optional[int] = None,
     min_solid_ratio: Optional[float] = None,
     greedy_topN: Optional[int] = None,
+
+    frcm_mode: Optional[str] = None,
+    frcm_min_overlap: Optional[float] = None,
 ):
     payload = await request.json()
     if isinstance(payload, list):
@@ -834,6 +877,7 @@ async def frcm_add(
         "stress": stress, "verbose": verbose,
         "grid_zx": grid_zx, "grid_zy": grid_zy, "min_solid_ratio": min_solid_ratio,
         "greedy_topN": greedy_topN,
+        "frcm_mode": frcm_mode, "frcm_min_overlap": frcm_min_overlap,
     }
     params = _merge_params(payload, query)
 
@@ -845,10 +889,7 @@ async def frcm_add(
 
     # selected zones (robusto)
     selected_rects: List[Rect] = _normalize_rects(payload.get("selected_zones"))
-    selected: List[Dict[str, float]] = [
-        {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
-        for (x1, x2, y1, y2) in selected_rects
-    ]
+    selected: List[Dict[str, float]] = [{"x1": x1, "x2": x2, "y1": y1, "y2": y2} for (x1, x2, y1, y2) in selected_rects]
 
     ranked = payload.get("ranked_candidates")
 
@@ -866,12 +907,14 @@ async def frcm_add(
     zones = cand["zones"]
 
     # se payload porta già ranking dallo screening, lo usiamo per scegliere topN
+    ranked_ids_received: List[str] = []
     if isinstance(ranked, list) and ranked:
         zones_by_id = {z["id"]: z for z in zones}
         ranked_zones = []
         for r in ranked:
             zid = r.get("id")
             if zid in zones_by_id:
+                ranked_ids_received.append(zid)
                 z = zones_by_id[zid].copy()
                 z["deltaV_single_hint"] = r.get("deltaV_single")
                 ranked_zones.append(z)
@@ -883,10 +926,11 @@ async def frcm_add(
     topN = int(params["greedy_topN"])
 
     # filtro: escludi già selezionate
+    excluded_ids = [z["id"] for z in zones_eval if _is_selected_zone(z, selected_rects)]
     zones_eval = [z for z in zones_eval if not _is_selected_zone(z, selected_rects)]
     zones_eval = zones_eval[:topN]
 
-    # current con rinforzi selezionati
+    # ✅ current con rinforzi selezionati
     current = run_pushover_case(openings=openings, frcm_zones=[dict(s) for s in selected], params=params)
     if current["status"] != "ok":
         return JSONResponse(content={
@@ -896,8 +940,9 @@ async def frcm_add(
             "next": None,
             "debug": {
                 "selected_rects_parsed": selected_rects,
-                "n_candidates": len(zones),
-                "n_eval": len(zones_eval),
+                "ranked_ids_received": ranked_ids_received,
+                "excluded_ids": excluded_ids,
+                "evaluated_ids": [],
             }
         })
 
@@ -949,6 +994,8 @@ async def frcm_add(
             "greedy": {"evaluated": trials, "heatmap": heatmap, "topN": topN},
             "debug": {
                 "selected_rects_parsed": selected_rects,
+                "ranked_ids_received": ranked_ids_received,
+                "excluded_ids": excluded_ids,
                 "evaluated_ids": [t["id"] for t in trials],
                 "best_trial_id": None,
             }
@@ -965,7 +1012,6 @@ async def frcm_add(
     new_selected = [dict(s) for s in selected] + [{
         "x1": added_zone["x1"], "x2": added_zone["x2"], "y1": added_zone["y1"], "y2": added_zone["y2"]
     }]
-    new_case = best_trial["case"]
 
     resp = {
         "meta": {
@@ -980,7 +1026,7 @@ async def frcm_add(
         "added": added_zone,
         "next": {
             "selected_zones": new_selected,  # sempre dict
-            "case": new_case,
+            "case": best_trial["case"],
         },
         "greedy": {
             "topN": topN,
@@ -989,12 +1035,13 @@ async def frcm_add(
         },
         "debug": {
             "selected_rects_parsed": selected_rects,
+            "ranked_ids_received": ranked_ids_received,
+            "excluded_ids": excluded_ids,
             "evaluated_ids": [t["id"] for t in trials],
             "best_trial_id": best_trial["id"],
         }
     }
     return JSONResponse(content=resp)
-
 
 # ============================================================
 #  /pushover (singolo caso con frcm_zones)
@@ -1014,6 +1061,9 @@ async def pushover_simple(
     testIter: Optional[int] = None,
     stress: Optional[int] = None,
     verbose: Optional[int] = None,
+
+    frcm_mode: Optional[str] = None,
+    frcm_min_overlap: Optional[float] = None,
 ):
     payload = await request.json()
     if isinstance(payload, list):
@@ -1027,6 +1077,7 @@ async def pushover_simple(
         "max_dx": max_dx, "max_dy": max_dy, "dU": dU, "max_steps": max_steps,
         "target_mm": target_mm, "Ptot": Ptot, "testTol": testTol, "testIter": testIter,
         "stress": stress, "verbose": verbose,
+        "frcm_mode": frcm_mode, "frcm_min_overlap": frcm_min_overlap,
     }
     params = _merge_params(payload, query)
 
