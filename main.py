@@ -126,15 +126,17 @@ def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, A
 
 
 # ============================================================
-#  OPENINGS UTILS
+#  RECT / OPENINGS UTILS
 # ============================================================
-def _normalize_openings(obj: Any) -> List[Tuple[float, float, float, float]]:
+Rect = Tuple[float, float, float, float]  # (x1,x2,y1,y2)
+
+def _normalize_openings(obj: Any) -> List[Rect]:
     """
     Supporta:
-      - openings: [[x1,x2,y1,y2], ...]
-      - openings: [{"x1":..,"x2":..,"y1":..,"y2":..}, ...]
+      - [[x1,x2,y1,y2], ...]
+      - [{"x1":..,"x2":..,"y1":..,"y2":..}, ...]
     """
-    out: List[Tuple[float, float, float, float]] = []
+    out: List[Rect] = []
     if obj is None:
         return out
     if not isinstance(obj, list):
@@ -146,13 +148,19 @@ def _normalize_openings(obj: Any) -> List[Tuple[float, float, float, float]]:
             out.append((float(o["x1"]), float(o["x2"]), float(o["y1"]), float(o["y2"])))
     return out
 
-def inside_opening(x: float, y: float, openings: List[Tuple[float, float, float, float]]) -> bool:
+def _rect_key_from_zone(z: Dict[str, Any]) -> Rect:
+    return (float(z["x1"]), float(z["x2"]), float(z["y1"]), float(z["y2"]))
+
+def _same_rect(a: Rect, b: Rect, tol: float = 1e-9) -> bool:
+    return all(abs(ai - bi) <= tol for ai, bi in zip(a, b))
+
+def inside_opening(x: float, y: float, openings: List[Rect]) -> bool:
     for (x1, x2, y1, y2) in openings:
         if (x > x1) and (x < x2) and (y > y1) and (y < y2):
             return True
     return False
 
-def openings_valid(openings: List[Tuple[float, float, float, float]]) -> bool:
+def openings_valid(openings: List[Rect]) -> bool:
     for (x1, x2, y1, y2) in openings:
         if x1 < PIER_MIN or x2 > (L - PIER_MIN):
             return False
@@ -181,12 +189,7 @@ def openings_valid(openings: List[Tuple[float, float, float, float]]) -> bool:
 
     return True
 
-
-# ============================================================
-#  ZONE UTILS (heatmap candidates)
-# ============================================================
-def rect_intersection_area(a: Tuple[float, float, float, float],
-                           b: Tuple[float, float, float, float]) -> float:
+def rect_intersection_area(a: Rect, b: Rect) -> float:
     ax1, ax2, ay1, ay2 = a
     bx1, bx2, by1, by2 = b
     ix1, ix2 = max(ax1, bx1), min(ax2, bx2)
@@ -195,7 +198,11 @@ def rect_intersection_area(a: Tuple[float, float, float, float],
         return 0.0
     return (ix2 - ix1) * (iy2 - iy1)
 
-def generate_candidate_zones(openings: List[Tuple[float, float, float, float]],
+
+# ============================================================
+#  ZONE UTILS (heatmap candidates)
+# ============================================================
+def generate_candidate_zones(openings: List[Rect],
                              nZX: int, nZY: int,
                              min_solid_ratio: float) -> Dict[str, Any]:
     zones: List[Dict[str, Any]] = []
@@ -223,13 +230,6 @@ def generate_candidate_zones(openings: List[Tuple[float, float, float, float]],
     return {"grid": {"nZX": nZX, "nZY": nZY}, "zones": zones}
 
 
-def _rect_key(z: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    return (float(z["x1"]), float(z["x2"]), float(z["y1"]), float(z["y2"]))
-
-def _same_rect(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], tol: float = 1e-9) -> bool:
-    return all(abs(ai - bi) <= tol for ai, bi in zip(a, b))
-
-
 # ============================================================
 #  MESH CONFORME
 # ============================================================
@@ -253,7 +253,7 @@ def _refine_intervals(coords: List[float], max_step: float) -> List[float]:
                 refined.append(a + seg * k / n)
     return _unique_sorted(refined)
 
-def build_conforming_grid(openings: List[Tuple[float, float, float, float]],
+def build_conforming_grid(openings: List[Rect],
                           max_dx: float, max_dy: float) -> Tuple[List[float], List[float]]:
     xs = [0.0, L, MARGIN, L - MARGIN]
     ys = [0.0, H, MARGIN, H - MARGIN]
@@ -279,7 +279,6 @@ def K_from_E_nu(E: float, nu: float) -> float:
 def G_from_E_nu(E: float, nu: float) -> float:
     return E / (2.0 * (1.0 + nu))
 
-
 def point_in_any_zone(xc: float, yc: float, zones: List[Dict[str, float]]) -> bool:
     for z in zones:
         x1, x2 = float(z["x1"]), float(z["x2"])
@@ -293,7 +292,7 @@ def point_in_any_zone(xc: float, yc: float, zones: List[Dict[str, float]]) -> bo
 #  BUILD MODEL (muratura + cordoli + FRCM proxy)
 # ============================================================
 def build_wall_J2_conforming_with_frcm(
-    openings: List[Tuple[float, float, float, float]],
+    openings: List[Rect],
     frcm_zones: List[Dict[str, float]],
     max_dx: float, max_dy: float,
     Ptot: float
@@ -480,8 +479,7 @@ def shear_at_target_disp(disp_mm: np.ndarray, shear_kN: np.ndarray, target_mm: f
         return None
     return float(np.interp(target_mm, disp_mm, shear_kN))
 
-
-def run_pushover_case(openings: List[Tuple[float, float, float, float]],
+def run_pushover_case(openings: List[Rect],
                       frcm_zones: List[Dict[str, float]],
                       params: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
@@ -627,17 +625,9 @@ def make_heatmap_cells(zones: List[Dict[str, Any]], value_key: str) -> List[Dict
         })
     return cells
 
-
-def _selected_contains(selected: List[Dict[str, Any]], z: Dict[str, Any]) -> bool:
-    rz = _rect_key(z)
-    for s in selected:
-        try:
-            rs = _rect_key(s)
-        except Exception:
-            continue
-        if _same_rect(rs, rz):
-            return True
-    return False
+def _is_selected_zone(z: Dict[str, Any], selected_rects: List[Rect]) -> bool:
+    rz = _rect_key_from_zone(z)
+    return any(_same_rect(rz, rs) for rs in selected_rects)
 
 
 # ============================================================
@@ -645,7 +635,7 @@ def _selected_contains(selected: List[Dict[str, Any]], z: Dict[str, Any]) -> boo
 # ============================================================
 app = FastAPI(
     title="Wall Pushover + FRCM Screening (Conforming Mesh)",
-    version="4.0.0",
+    version="4.0.1",
     description="Baseline + screening zone FRCM + greedy add, con timing in JSON."
 )
 
@@ -738,26 +728,21 @@ async def frcm_screening(
                 "message": out["message"],
                 "mesh": out.get("mesh"),
                 "timing_s": out.get("timing_s"),
-                # curve per la UI (solo per best la mettiamo dopo, per non gonfiare risposta)
             }
         })
 
     t_sc = time.time() - t_sc0
 
-    # best zone
     valid = [r for r in results if isinstance(r.get("deltaV_single"), (int, float))]
     best = max(valid, key=lambda r: float(r["deltaV_single"])) if valid else None
 
     best_case = None
     if best is not None:
-        # ricalcolo best includendo curve (oppure prendila dall'ultimo run -> ma non abbiamo salvato curve)
         frcm_best = [{"x1": best["x1"], "x2": best["x2"], "y1": best["y1"], "y2": best["y2"]}]
         best_case = run_pushover_case(openings=openings, frcm_zones=frcm_best, params=params)
 
-    # heatmap-ready
     heatmap = make_heatmap_cells(results, "deltaV_single")
 
-    # risposta snella: curve baseline + curve best, tabella zone con deltaV
     resp = {
         "meta": {
             "params_used": params,
@@ -770,8 +755,8 @@ async def frcm_screening(
         "baseline": baseline,
         "screening": {
             "grid": cand["grid"],
-            "zones": results,      # contiene deltaV_single + solid_ratio + coords + timings per zona
-            "heatmap": heatmap,    # per Lovable
+            "zones": results,
+            "heatmap": heatmap,
         },
         "recommendation": (None if best is None else {
             "best_zone": {
@@ -828,8 +813,12 @@ async def frcm_add(
     if not openings_valid(openings):
         return JSONResponse(status_code=400, content={"error": "openings_invalid"})
 
-    selected_zones = _normalize_openings(payload.get("selected_zones"))
-    selected = [{"x1": a, "x2": b, "y1": c, "y2": d} for (a, b, c, d) in selected_zones]
+    # ---- selected zones (robusto) ----
+    selected_rects: List[Rect] = _normalize_openings(payload.get("selected_zones"))
+    selected: List[Dict[str, float]] = [
+        {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
+        for (x1, x2, y1, y2) in selected_rects
+    ]
 
     t_req0 = time.time()
 
@@ -842,13 +831,11 @@ async def frcm_add(
         min_solid_ratio=float(params["min_solid_ratio"]),
     )
     t_z = time.time() - t_z0
-
     zones = cand["zones"]
 
     # se payload porta già ranking dallo screening, lo usiamo per scegliere topN
     ranked = payload.get("ranked_candidates")
     if isinstance(ranked, list) and ranked:
-        # mi aspetto items con almeno id + coords + deltaV_single
         zones_by_id = {z["id"]: z for z in zones}
         ranked_zones = []
         for r in ranked:
@@ -857,20 +844,19 @@ async def frcm_add(
                 z = zones_by_id[zid].copy()
                 z["deltaV_single_hint"] = r.get("deltaV_single")
                 ranked_zones.append(z)
-        # sort by hint
         ranked_zones.sort(key=lambda z: float(z.get("deltaV_single_hint") or -1e18), reverse=True)
         zones_eval = ranked_zones
     else:
-        # fallback: usa tutte, ma poi tronca
         zones_eval = zones
 
     topN = int(params["greedy_topN"])
-    # filtra: non già selezionate
-    zones_eval = [z for z in zones_eval if not _selected_contains(selected, z)]
+
+    # ✅ filtro CORRETTO: non riproporre zone già selezionate
+    zones_eval = [z for z in zones_eval if not _is_selected_zone(z, selected_rects)]
     zones_eval = zones_eval[:topN]
 
-    # current (con selected)
-    current = run_pushover_case(openings=openings, frcm_zones=selected, params=params)
+    # ✅ current: deve essere con i rinforzi selezionati (copy difensiva)
+    current = run_pushover_case(openings=openings, frcm_zones=[dict(s) for s in selected], params=params)
     if current["status"] != "ok":
         return JSONResponse(content={
             "meta": {"params_used": params, "timing_s": {"request_total": float(time.time() - t_req0), "zones_gen": float(t_z)}},
@@ -883,11 +869,11 @@ async def frcm_add(
 
     # prova aggiunta di ciascuna candidata (solo topN)
     t_g0 = time.time()
-    trials = []
-    best_trial = None
+    trials: List[Dict[str, Any]] = []
+    best_trial: Optional[Dict[str, Any]] = None
 
     for z in zones_eval:
-        trial_zones = selected + [{"x1": z["x1"], "x2": z["x2"], "y1": z["y1"], "y2": z["y2"]}]
+        trial_zones = [dict(s) for s in selected] + [{"x1": z["x1"], "x2": z["x2"], "y1": z["y1"], "y2": z["y2"]}]
         out = run_pushover_case(openings=openings, frcm_zones=trial_zones, params=params)
         Vt = out.get("V_target")
         deltaV = (float(Vt) - Vcur) if (Vt is not None) else None
@@ -935,8 +921,7 @@ async def frcm_add(
         "deltaV_marginal": best_trial.get("deltaV_marginal"),
     }
 
-    # new selection = selected + added
-    new_selected = selected + [{"x1": added_zone["x1"], "x2": added_zone["x2"], "y1": added_zone["y1"], "y2": added_zone["y2"]}]
+    new_selected = [dict(s) for s in selected] + [{"x1": added_zone["x1"], "x2": added_zone["x2"], "y1": added_zone["y1"], "y2": added_zone["y2"]}]
     new_case = best_trial["case"]
 
     resp = {
@@ -951,7 +936,7 @@ async def frcm_add(
         "current": current,
         "added": added_zone,
         "next": {
-            "selected_zones": new_selected,
+            "selected_zones": new_selected,   # ✅ sempre dict, non list di list
             "case": new_case,
         },
         "greedy": {
@@ -966,7 +951,6 @@ async def frcm_add(
 @app.post("/pushover")
 async def pushover_simple(
     request: Request,
-    # query params opzionali
     max_dx: Optional[float] = None,
     max_dy: Optional[float] = None,
     dU: Optional[float] = None,
@@ -978,9 +962,6 @@ async def pushover_simple(
     stress: Optional[int] = None,
     verbose: Optional[int] = None,
 ):
-    """
-    Endpoint semplice: openings + (opzionale) frcm_zones
-    """
     payload = await request.json()
     if isinstance(payload, list):
         if not payload:
