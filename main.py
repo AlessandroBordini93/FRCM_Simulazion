@@ -21,7 +21,7 @@ PIER_MIN = 0.30
 Rect = Tuple[float, float, float, float]  # (x1,x2,y1,y2)
 
 # ============================================================
-#  DEFAULTS (come richiesto)
+#  DEFAULTS
 # ============================================================
 DEFAULTS = {
     "stress": 0,
@@ -49,9 +49,14 @@ DEFAULTS = {
     "min_solid_ratio": 0.85,
     "greedy_topN": 25,
 
-    # fix selezione rinforzo: intersezione elemento-zona
+    # selezione rinforzo
     "frcm_mode": "intersection",
     "frcm_min_overlap": 0.02,
+
+    # ✅ equivalente muratura + FRCM (BOOST)
+    #   - aumenta rigidezza e resistenza nelle zone rinforzate
+    "frcm_E_mult": 2.5,     # E_eq = E_mur * frcm_E_mult
+    "frcm_sig_mult": 3.0,   # sig0/sigInf eq = mur * frcm_sig_mult
 }
 
 CLAMPS = {
@@ -70,28 +75,22 @@ CLAMPS = {
     "greedy_topN": (5, 80),
 
     "frcm_min_overlap": (0.0, 1.0),
+
+    # ✅ clamp boost
+    "frcm_E_mult": (1.0, 10.0),
+    "frcm_sig_mult": (1.0, 20.0),
 }
 
 # ============================================================
-#  PAYLOAD UNWRAP (🔥 fix vero: Lovable / wrapper / nesting)
+#  PAYLOAD UNWRAP (Lovable / n8n wrappers)
 # ============================================================
 def _unwrap_payload(obj: Any) -> Dict[str, Any]:
-    """
-    Accetta:
-      - {"openings":...} (dict)
-      - [ {...} ] (lista con 1 dict)
-      - {"data": {...}} / {"body": {...}} / {"input": {...}} / {"payload": {...}}
-      - anche nesting in "next"
-    Restituisce sempre un dict o {}.
-    """
-    # strip wrapper list
     while isinstance(obj, list) and len(obj) == 1:
         obj = obj[0]
 
     if not isinstance(obj, dict):
         return {}
 
-    # unwrap common containers
     for k in ("data", "body", "input", "payload"):
         v = obj.get(k)
         if isinstance(v, dict):
@@ -148,8 +147,12 @@ def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, A
     out["stress"] = 1 if _as_int(out["stress"], 0) == 1 else 0
     out["verbose"] = 1 if _as_int(out.get("verbose", 0), 0) == 1 else 0
 
-    for k in ["max_dx", "max_dy", "dU", "target_mm", "Ptot", "testTol", "min_solid_ratio", "frcm_min_overlap"]:
+    for k in [
+        "max_dx", "max_dy", "dU", "target_mm", "Ptot", "testTol", "min_solid_ratio",
+        "frcm_min_overlap", "frcm_E_mult", "frcm_sig_mult"
+    ]:
         out[k] = _clamp(k, _as_float(out.get(k), DEFAULTS[k]))
+
     for k in ["max_steps", "testIter", "n_bins_x", "n_bins_y", "grid_zx", "grid_zy", "greedy_topN"]:
         out[k] = _clamp(k, _as_int(out.get(k), DEFAULTS[k]))
 
@@ -333,7 +336,7 @@ def overlaps_any_zone(elem_rect: Rect, zones: List[Dict[str, float]], min_overla
     return False
 
 # ============================================================
-#  BUILD MODEL
+#  BUILD MODEL (✅ FRCM = muratura + FRCM equivalente)
 # ============================================================
 def build_wall_J2_conforming_with_frcm(
     openings: List[Rect],
@@ -343,6 +346,8 @@ def build_wall_J2_conforming_with_frcm(
     Ptot: float,
     frcm_mode: str = "intersection",
     frcm_min_overlap: float = 0.02,
+    frcm_E_mult: float = 2.5,
+    frcm_sig_mult: float = 3.0,
 ) -> Dict[str, Any]:
     ops.wipe()
     ops.model("basic", "-ndm", 2, "-ndf", 2)
@@ -364,12 +369,16 @@ def build_wall_J2_conforming_with_frcm(
         if key in node_tags:
             ops.fix(node_tags[key], 1, 1)
 
+    # ----------------------------
+    # Materiali base
+    # ----------------------------
     E_mur, nu_mur = 1.5e9, 0.15
     sig0_m, sigInf_m, delta_m, H_m = 0.5e6, 2.0e6, 8.0, 0.0
 
     E_cord, nu_cord = 30e9, 0.20
     sig0_c, sigInf_c, delta_c, H_c = 6.0e6, 25.0e6, 6.0, 0.0
 
+    # (materiale FRCM puro rimane definito, ma non lo useremo più come "solo FRCM")
     E_frcm, nu_frcm = 3.0e9, 0.18
     sig0_f, sigInf_f, delta_f, H_f = 1.2e6, 4.0e6, 8.0, 0.0
 
@@ -377,14 +386,35 @@ def build_wall_J2_conforming_with_frcm(
     K_c, G_c = K_from_E_nu(E_cord, nu_cord), G_from_E_nu(E_cord, nu_cord)
     K_f, G_f = K_from_E_nu(E_frcm, nu_frcm), G_from_E_nu(E_frcm, nu_frcm)
 
+    # J2 3D
     ops.nDMaterial("J2Plasticity", 10, K_m, G_m, sig0_m, sigInf_m, delta_m, H_m)
     ops.nDMaterial("J2Plasticity", 20, K_c, G_c, sig0_c, sigInf_c, delta_c, H_c)
     ops.nDMaterial("J2Plasticity", 30, K_f, G_f, sig0_f, sigInf_f, delta_f, H_f)
 
-    ops.nDMaterial("PlaneStress", 1, 10)
-    ops.nDMaterial("PlaneStress", 2, 20)
-    ops.nDMaterial("PlaneStress", 3, 30)
+    # PlaneStress wrappers
+    ops.nDMaterial("PlaneStress", 1, 10)  # muratura
+    ops.nDMaterial("PlaneStress", 2, 20)  # cordoli
+    ops.nDMaterial("PlaneStress", 3, 30)  # FRCM puro (non usato per rinforzo equivalente)
 
+    # ----------------------------
+    # ✅ Equivalente muratura + FRCM
+    # ----------------------------
+    frcm_E_mult = float(frcm_E_mult)
+    frcm_sig_mult = float(frcm_sig_mult)
+
+    E_eq = E_mur * frcm_E_mult
+    nu_eq = nu_mur  # stabilità
+    sig0_eq = sig0_m * frcm_sig_mult
+    sigInf_eq = sigInf_m * frcm_sig_mult
+
+    K_eq, G_eq = K_from_E_nu(E_eq, nu_eq), G_from_E_nu(E_eq, nu_eq)
+
+    ops.nDMaterial("J2Plasticity", 40, K_eq, G_eq, sig0_eq, sigInf_eq, delta_m, H_m)
+    ops.nDMaterial("PlaneStress", 4, 40)  # ✅ questo è il rinforzo vero
+
+    # ----------------------------
+    # Regola selezione
+    # ----------------------------
     frcm_mode = (frcm_mode or "intersection").strip().lower()
     if frcm_mode not in ("centroid", "intersection"):
         frcm_mode = "intersection"
@@ -406,13 +436,15 @@ def build_wall_J2_conforming_with_frcm(
             if not all(k in node_tags for k in keys):
                 continue
 
+            # base: cordolo vince sempre
             this_mat = 2 if in_cord else 1
 
+            # ✅ rinforzo SOLO su muratura (mai su cordoli)
             if (not in_cord) and frcm_zones:
                 if frcm_mode == "intersection":
                     elem_rect = quad_bbox(x1e, x2e, y1e, y2e)
                     if overlaps_any_zone(elem_rect, frcm_zones, min_overlap_ratio=frcm_min_overlap):
-                        this_mat = 3
+                        this_mat = 4  # ✅ muratura + FRCM equivalente
                         frcm_hits += 1
 
             n1 = node_tags[keys[0]]
@@ -424,6 +456,7 @@ def build_wall_J2_conforming_with_frcm(
             ele_mat[eleTag] = this_mat
             eleTag += 1
 
+    # carico in sommità
     j_top = len(ys) - 1
     top_nodes = [node_tags[(i, j_top)] for i in range(len(xs)) if (i, j_top) in node_tags]
     if not top_nodes:
@@ -449,6 +482,8 @@ def build_wall_J2_conforming_with_frcm(
         "frcm_hits": int(frcm_hits),
         "frcm_mode": frcm_mode,
         "frcm_min_overlap": float(frcm_min_overlap),
+        "frcm_E_mult": float(frcm_E_mult),
+        "frcm_sig_mult": float(frcm_sig_mult),
     }
 
 # ============================================================
@@ -484,6 +519,8 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
         Ptot=float(params["Ptot"]),
         frcm_mode=str(params.get("frcm_mode", "intersection")),
         frcm_min_overlap=float(params.get("frcm_min_overlap", 0.02)),
+        frcm_E_mult=float(params.get("frcm_E_mult", DEFAULTS["frcm_E_mult"])),
+        frcm_sig_mult=float(params.get("frcm_sig_mult", DEFAULTS["frcm_sig_mult"])),
     )
 
     node_tags = model["node_tags"]
@@ -500,6 +537,8 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
         "frcm_hits": model.get("frcm_hits", 0),
         "frcm_mode": model.get("frcm_mode"),
         "frcm_min_overlap": model.get("frcm_min_overlap"),
+        "frcm_E_mult": model.get("frcm_E_mult"),
+        "frcm_sig_mult": model.get("frcm_sig_mult"),
     }
 
     ops.constraints(str(params["constraints"]))
@@ -563,8 +602,8 @@ def run_pushover_case(openings: List[Rect], frcm_zones: List[Dict[str, float]], 
 # ============================================================
 app = FastAPI(
     title="Wall Pushover + FRCM Screening (Conforming Mesh)",
-    version="7.0.0",
-    description="Fix definitivo parsing /frcm/add + debug payload + defaults veloci."
+    version="8.0.0",
+    description="Parsing robusto + /frcm/add fix + FRCM equivalente muratura+FRCM (PlaneStress 4)."
 )
 
 @app.get("/")
@@ -592,6 +631,8 @@ async def frcm_screening(
     min_solid_ratio: Optional[float] = None,
     frcm_mode: Optional[str] = None,
     frcm_min_overlap: Optional[float] = None,
+    frcm_E_mult: Optional[float] = None,
+    frcm_sig_mult: Optional[float] = None,
 ):
     raw = await request.json()
     payload = _unwrap_payload(raw)
@@ -604,6 +645,7 @@ async def frcm_screening(
         "stress": stress, "verbose": verbose,
         "grid_zx": grid_zx, "grid_zy": grid_zy, "min_solid_ratio": min_solid_ratio,
         "frcm_mode": frcm_mode, "frcm_min_overlap": frcm_min_overlap,
+        "frcm_E_mult": frcm_E_mult, "frcm_sig_mult": frcm_sig_mult,
     }
     params = _merge_params(payload, query)
 
@@ -652,7 +694,7 @@ async def frcm_screening(
     })
 
 # ============================================================
-#  /frcm/add (🔥 FIX QUI)
+#  /frcm/add
 # ============================================================
 @app.post("/frcm/add")
 async def frcm_add(
@@ -673,6 +715,8 @@ async def frcm_add(
     greedy_topN: Optional[int] = None,
     frcm_mode: Optional[str] = None,
     frcm_min_overlap: Optional[float] = None,
+    frcm_E_mult: Optional[float] = None,
+    frcm_sig_mult: Optional[float] = None,
 ):
     raw = await request.json()
     payload = _unwrap_payload(raw)
@@ -686,6 +730,7 @@ async def frcm_add(
         "grid_zx": grid_zx, "grid_zy": grid_zy, "min_solid_ratio": min_solid_ratio,
         "greedy_topN": greedy_topN,
         "frcm_mode": frcm_mode, "frcm_min_overlap": frcm_min_overlap,
+        "frcm_E_mult": frcm_E_mult, "frcm_sig_mult": frcm_sig_mult,
     }
     params = _merge_params(payload, query)
 
@@ -695,7 +740,6 @@ async def frcm_add(
     if not openings_valid(openings):
         return JSONResponse(status_code=400, content={"error": "openings_invalid"})
 
-    # ✅ leggi selected_zones anche se arriva nested
     selected_raw = (
         payload.get("selected_zones")
         or payload.get("selectedZones")
@@ -705,7 +749,6 @@ async def frcm_add(
     selected_rects: List[Rect] = _normalize_rects(selected_raw)
     selected: List[Dict[str, float]] = [{"x1": x1, "x2": x2, "y1": y1, "y2": y2} for (x1, x2, y1, y2) in selected_rects]
 
-    # ✅ ranked candidates: snake o camel
     ranked_raw = payload.get("ranked_candidates") or payload.get("rankedCandidates")
     ranked_list = ranked_raw if isinstance(ranked_raw, list) else []
 
@@ -719,7 +762,6 @@ async def frcm_add(
     )
     zones = cand["zones"]
 
-    # ranking by id
     ranked_ids_received: List[str] = []
     if ranked_list:
         zones_by_id = {z["id"]: z for z in zones}
@@ -736,12 +778,10 @@ async def frcm_add(
     else:
         zones_eval = zones
 
-    # ✅ qui sta il punto: ESCLUDI davvero le già selezionate
     excluded_ids = [z["id"] for z in zones_eval if _is_selected_zone(z, selected_rects)]
     zones_eval = [z for z in zones_eval if not _is_selected_zone(z, selected_rects)]
     zones_eval = zones_eval[: int(params["greedy_topN"])]
 
-    # ✅ current deve includere selected
     current = run_pushover_case(openings=openings, frcm_zones=[dict(s) for s in selected], params=params)
     Vcur = float(current["V_target"]) if current["status"] == "ok" and current.get("V_target") is not None else None
 
@@ -772,7 +812,6 @@ async def frcm_add(
             "case": best_trial["case"],
         }),
         "greedy": {"evaluated": trials, "heatmap": make_heatmap_cells(trials, "deltaV_marginal")},
-        # 🔥 DEBUG che ti dice se Lovable ti sta davvero mandando le chiavi
         "debug": {
             "payload_keys": list(payload.keys()),
             "selected_raw_type": str(type(selected_raw)),
@@ -803,6 +842,8 @@ async def pushover_simple(
     verbose: Optional[int] = None,
     frcm_mode: Optional[str] = None,
     frcm_min_overlap: Optional[float] = None,
+    frcm_E_mult: Optional[float] = None,
+    frcm_sig_mult: Optional[float] = None,
 ):
     raw = await request.json()
     payload = _unwrap_payload(raw)
@@ -814,12 +855,12 @@ async def pushover_simple(
         "target_mm": target_mm, "Ptot": Ptot, "testTol": testTol, "testIter": testIter,
         "stress": stress, "verbose": verbose,
         "frcm_mode": frcm_mode, "frcm_min_overlap": frcm_min_overlap,
+        "frcm_E_mult": frcm_E_mult, "frcm_sig_mult": frcm_sig_mult,
     }
     params = _merge_params(payload, query)
 
     openings = _normalize_rects(payload.get("openings"))
     frcm = _normalize_rects(payload.get("frcm_zones"))
-
     if not openings:
         return JSONResponse(status_code=400, content={"error": "Manca 'openings'."})
     if not openings_valid(openings):
