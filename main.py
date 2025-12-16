@@ -55,8 +55,8 @@ DEFAULTS = {
 
     # ✅ equivalente muratura + FRCM (BOOST)
     #   - aumenta rigidezza e resistenza nelle zone rinforzate
-    "frcm_E_mult": 2.5,     # E_eq = E_mur * frcm_E_mult
-    "frcm_sig_mult": 3.0,   # sig0/sigInf eq = mur * frcm_sig_mult
+    "frcm_E_mult": 1.3,     # E_eq = E_mur * frcm_E_mult
+    "frcm_sig_mult": 1.5,   # sig0/sigInf eq = mur * frcm_sig_mult
 }
 
 CLAMPS = {
