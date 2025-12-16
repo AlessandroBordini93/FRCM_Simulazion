@@ -234,29 +234,48 @@ def rect_intersection_area(a: Rect, b: Rect) -> float:
 #  ZONE UTILS
 # ============================================================
 def generate_candidate_zones(openings: List[Rect], nZX: int, nZY: int, min_solid_ratio: float) -> Dict[str, Any]:
+    """
+    ✅ MODIFICA MINIMA (chiesta):
+    - Candidate zones = SOLO rettangoli con continuità verticale terra-cielo (0..H)
+    - Tagli verticali solo su bordi aperture + (0,L)
+    - Ogni fascia (x1,x2) è candidata solo se NON è interrotta da nessuna apertura in quella fascia.
+    - Pochissime zone -> screening molto più veloce.
+    Nota: nZX/nZY restano in firma per compatibilità con API, ma qui non servono.
+    """
     zones: List[Dict[str, Any]] = []
-    dx = L / nZX
-    dy = H / nZY
-    for j in range(nZY):
-        for i in range(nZX):
-            x1, x2 = i * dx, (i + 1) * dx
-            y1, y2 = j * dy, (j + 1) * dy
-            area = dx * dy
 
-            void = 0.0
-            for op in openings:
-                void += rect_intersection_area((x1, x2, y1, y2), op)
+    # Tagli verticali: 0, L e bordi aperture
+    xs = _unique_sorted([0.0, L] + [x for (x1, x2, _, _) in openings for x in (x1, x2)])
 
-            solid_ratio = max(0.0, (area - void) / area)
-            if solid_ratio >= min_solid_ratio:
-                zones.append({
-                    "id": f"z_{i}_{j}",
-                    "i": i, "j": j,
-                    "x1": x1, "x2": x2, "y1": y1, "y2": y2,
-                    "solid_ratio": float(solid_ratio),
-                })
+    zid = 0
+    for i, (x1, x2) in enumerate(zip(xs[:-1], xs[1:])):
+        if x2 <= x1:
+            continue
 
-    return {"grid": {"nZX": nZX, "nZY": nZY}, "zones": zones}
+        # Se esiste un'apertura che copre tutta la fascia (x1,x2), allora la continuità verticale è interrotta
+        interrupted = False
+        for (ox1, ox2, oy1, oy2) in openings:
+            if (ox1 <= x1 + 1e-9) and (ox2 >= x2 - 1e-9):
+                interrupted = True
+                break
+
+        if interrupted:
+            continue
+
+        # Fascia continua terra-cielo
+        zones.append({
+            "id": f"z_{zid}",
+            "i": i,
+            "j": 0,
+            "x1": float(x1),
+            "x2": float(x2),
+            "y1": 0.0,
+            "y2": float(H),
+            "solid_ratio": 1.0,
+        })
+        zid += 1
+
+    return {"grid": {"mode": "vertical_continuous", "nZX": len(zones), "nZY": 1}, "zones": zones}
 
 def make_heatmap_cells(zones: List[Dict[str, Any]], value_key: str) -> List[Dict[str, Any]]:
     return [{
